@@ -18,7 +18,7 @@
 无需安装，直接从 GitHub 运行：
 
 ```bash
-uvx --from git+https://github.com/h-lu/openalex-mcp openalex-mcp
+uvx --from git+https://github.com/h-lu/openalex openalex-mcp
 ```
 
 ### 方式二：本地安装
@@ -32,7 +32,7 @@ uv run python openalex_mcp_server.py
 ### 方式三：pip 安装
 
 ```bash
-pip install git+https://github.com/h-lu/openalex-mcp
+pip install git+https://github.com/h-lu/openalex
 openalex-mcp
 ```
 
@@ -47,7 +47,7 @@ openalex-mcp
   "mcpServers": {
     "openalex": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/h-lu/openalex-mcp", "openalex-mcp"],
+      "args": ["--from", "git+https://github.com/h-lu/openalex", "openalex-mcp"],
       "env": {
         "OPENALEX_EMAIL": "your-email@example.com"
       }
