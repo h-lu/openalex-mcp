@@ -275,12 +275,13 @@ def test_fetch_author_detail():
     print(f"总引用: {data['cited_by_count']}")
     print(f"H指数: {data.get('summary_stats', {}).get('h_index')}")
     
-    # 机构
+    # 机构 (affiliations 结构是 {institution: {display_name: ...}})
     affiliations = data.get("affiliations", [])
     if affiliations:
         print(f"\n机构:")
         for a in affiliations[:3]:
-            print(f"  - {a['display_name']}")
+            inst = a.get("institution", {})
+            print(f"  - {inst.get('display_name', 'N/A')}")
     
     # 获取代表作
     works = req("works", {
@@ -311,9 +312,12 @@ def test_fetch_funder_detail():
     print(f"名称: {data['display_name']}")
     print(f"ID: {data['id'].split('/')[-1]}")
     print(f"国家: {data.get('country_code', 'N/A')}")
-    print(f"资助论文数: {data.get('works_count', 'N/A'):,}")
-    print(f"总引用: {data.get('cited_by_count', 'N/A'):,}")
-    print(f"资助项目数: {data.get('grants_count', 'N/A'):,}")
+    works_count = data.get('works_count')
+    cited_count = data.get('cited_by_count')
+    grants_count = data.get('grants_count')
+    print(f"资助论文数: {works_count:,}" if works_count else "资助论文数: N/A")
+    print(f"总引用: {cited_count:,}" if cited_count else "总引用: N/A")
+    print(f"资助项目数: {grants_count:,}" if grants_count else "资助项目数: N/A")
     print(f"主页: {data.get('homepage_url', 'N/A')}")
     
     # 获取该机构资助的高引论文
