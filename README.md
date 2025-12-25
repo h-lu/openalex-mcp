@@ -21,7 +21,7 @@
 ### 方式一：uvx 免安装运行（推荐）
 
 ```bash
-uvx --from git+https://github.com/h-lu/openalex openalex-mcp
+uvx --from git+https://github.com/h-lu/openalex-mcp openalex-mcp
 ```
 
 ### 方式二：本地运行
@@ -41,7 +41,7 @@ uv run openalex-mcp
   "mcpServers": {
     "openalex": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/h-lu/openalex", "openalex-mcp"],
+      "args": ["--from", "git+https://github.com/h-lu/openalex-mcp", "openalex-mcp"],
       "env": {
         "OPENALEX_EMAIL": "your-email@example.com"
       }
