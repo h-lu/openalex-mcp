@@ -4,11 +4,6 @@ OpenAlex MCP Server - 使用 FastMCP 构建的学术论文搜索工具
 提供给 AI Agent (如 Cursor, Claude Desktop) 使用的 MCP 工具，
 用于搜索和获取 OpenAlex 上的学术论文信息。
 
-最佳实践 (2025.12):
-- 工具数量精简: 使用 search + fetch 模式（参考 ChatGPT Deep Research）
-- 清晰的工具职责: 每个工具有明确单一的用途
-- 类型提示完整: 所有函数都有完整的类型注解
-
 支持的实体类型:
 - works: 论文、书籍、数据集、学位论文
 - authors: 作者
@@ -17,12 +12,17 @@ OpenAlex MCP Server - 使用 FastMCP 构建的学术论文搜索工具
 - topics: 主题分类
 - publishers: 出版商
 - funders: 资助机构
+- keywords: 关键词
 - continents/countries: 地理位置
 
+工具设计 (3个):
+1. search_openalex - 简单搜索（用户友好接口）
+2. query_openalex - 高级查询（支持原生 filter 语法）
+3. fetch_openalex - 获取实体详情
+
 运行方式:
-    1. stdio 模式 (用于 Cursor/Claude Desktop): python openalex_mcp_server.py
-    2. http 模式 (用于调试): python openalex_mcp_server.py --http
-    3. 使用 fastmcp CLI: fastmcp run openalex_mcp_server.py
+    1. stdio 模式: python openalex_mcp_server.py
+    2. http 模式: python openalex_mcp_server.py --http
 """
 
 import datetime
@@ -35,67 +35,43 @@ from fastmcp import FastMCP
 mcp = FastMCP(
     name="OpenAlex",
     instructions="""
-    OpenAlex 学术论文搜索工具。提供两个核心工具：
+    OpenAlex 学术文献搜索工具。提供三个核心工具：
     
-    1. search_openalex - 搜索各类学术实体
-    2. fetch_openalex - 获取具体实体的详细信息
+    1. search_openalex - 简单搜索（适合基本查询）
+    2. query_openalex - 高级查询（支持复杂过滤器组合）
+    3. fetch_openalex - 获取实体详情
     
-    支持的实体类型:
-    - works: 论文、书籍、数据集
-    - authors: 作者
-    - sources: 期刊、会议
-    - institutions: 大学、研究机构
-    - topics: 主题分类
-    - publishers: 出版商
-    - funders: 资助机构
-    - continents/countries: 地理位置
+    支持的实体: works, authors, sources, institutions, topics, publishers, funders, keywords, continents, countries
     
-    典型工作流:
-    1. 使用 search_openalex 搜索，获取 ID 列表
-    2. 使用 fetch_openalex 获取感兴趣项目的详细信息
-    
-    数据来源: OpenAlex (https://openalex.org) - 包含 2.5 亿+ 学术论文
+    数据来源: OpenAlex (https://openalex.org) - 2.5亿+ 学术论文
     """
 )
 
-# OpenAlex API 基础URL
+# API 配置
 BASE_URL = "https://api.openalex.org"
-
-# 添加邮箱以提高速率限制 (1次/秒 -> 10次/秒)
-# 通过环境变量 OPENALEX_EMAIL 配置，可在 mcp.json 的 env 字段中设置
 OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", "openalex-mcp@example.com")
 DEFAULT_PARAMS = {"mailto": OPENALEX_EMAIL}
 
-# 支持的实体类型映射
-ENTITY_TYPES = {
-    # 搜索时使用的实体类型（复数形式）
-    "works": "works",
-    "authors": "authors", 
-    "sources": "sources",
-    "institutions": "institutions",
-    "topics": "topics",
-    "publishers": "publishers",
-    "funders": "funders",
-    "continents": "continents",
-    "countries": "countries",
-}
+# 实体类型映射
+SEARCH_ENTITY_TYPES = Literal["works", "authors", "sources", "institutions", "topics", "publishers", "funders", "keywords", "continents", "countries"]
+FETCH_ENTITY_TYPES = Literal["work", "author", "source", "institution", "topic", "publisher", "funder", "keyword", "continent", "country"]
 
-# fetch 时使用的实体类型（单数形式映射到复数）
-ENTITY_TYPE_SINGULAR = {
-    "work": "works",
-    "author": "authors",
-    "source": "sources",
-    "institution": "institutions",
-    "topic": "topics",
-    "publisher": "publishers",
-    "funder": "funders",
-    "continent": "continents",
-    "country": "countries",
+ENTITY_ENDPOINTS = {
+    "works": "works", "work": "works",
+    "authors": "authors", "author": "authors",
+    "sources": "sources", "source": "sources",
+    "institutions": "institutions", "institution": "institutions",
+    "topics": "topics", "topic": "topics",
+    "publishers": "publishers", "publisher": "publishers",
+    "funders": "funders", "funder": "funders",
+    "keywords": "keywords", "keyword": "keywords",
+    "continents": "continents", "continent": "continents",
+    "countries": "countries", "country": "countries",
 }
 
 
-def _make_request(endpoint: str, params: dict | None = None) -> dict:
-    """发送 API 请求的辅助函数"""
+def _request(endpoint: str, params: dict | None = None) -> dict:
+    """发送 API 请求"""
     url = f"{BASE_URL}/{endpoint}"
     all_params = {**DEFAULT_PARAMS, **(params or {})}
     response = requests.get(url, params=all_params, timeout=30)
@@ -103,357 +79,304 @@ def _make_request(endpoint: str, params: dict | None = None) -> dict:
     return response.json()
 
 
-def _format_paper_brief(paper: dict) -> dict:
+def _clean_id(id_str: str) -> str:
+    """清理 OpenAlex ID，移除 URL 前缀"""
+    if id_str:
+        return id_str.replace("https://openalex.org/", "")
+    return id_str
+
+
+def _format_work_brief(w: dict) -> dict:
     """格式化论文简要信息"""
-    authorships = paper.get("authorships", [])
-    first_author = authorships[0].get("author", {}).get("display_name") if authorships else "Unknown"
-    
-    primary_location = paper.get("primary_location", {}) or {}
-    source = primary_location.get("source", {}) or {}
-    
+    auths = w.get("authorships", [])
+    loc = w.get("primary_location", {}) or {}
+    src = loc.get("source", {}) or {}
     return {
-        "id": paper.get("id", "").replace("https://openalex.org/", ""),
-        "title": paper.get("title"),
-        "doi": paper.get("doi"),
-        "publication_date": paper.get("publication_date"),
-        "cited_by_count": paper.get("cited_by_count"),
-        "first_author": first_author,
-        "author_count": len(authorships),
-        "journal": source.get("display_name"),
-        "is_oa": paper.get("open_access", {}).get("is_oa"),
+        "id": _clean_id(w.get("id", "")),
+        "title": w.get("title"),
+        "doi": w.get("doi"),
+        "year": w.get("publication_year"),
+        "cited_by_count": w.get("cited_by_count"),
+        "first_author": auths[0].get("author", {}).get("display_name") if auths else None,
+        "authors_count": len(auths),
+        "journal": src.get("display_name"),
+        "type": w.get("type"),
+        "is_oa": w.get("open_access", {}).get("is_oa"),
     }
 
 
-def _format_paper_full(paper: dict) -> dict:
+def _format_work_full(w: dict) -> dict:
     """格式化论文完整信息"""
-    # 提取作者信息
-    authors = []
-    for authorship in paper.get("authorships", []):
-        authors.append({
-            "name": authorship.get("author", {}).get("display_name"),
-            "orcid": authorship.get("author", {}).get("orcid"),
-            "position": authorship.get("author_position"),
-            "institutions": [
-                inst.get("display_name") 
-                for inst in authorship.get("institutions", [])
-            ],
-            "countries": authorship.get("countries", [])
-        })
+    # 作者信息
+    authors = [{
+        "name": a.get("author", {}).get("display_name"),
+        "id": _clean_id(a.get("author", {}).get("id", "")),
+        "orcid": a.get("author", {}).get("orcid"),
+        "position": a.get("author_position"),
+        "institutions": [i.get("display_name") for i in a.get("institutions", [])],
+        "countries": a.get("countries", []),
+    } for a in w.get("authorships", [])]
     
-    # 提取期刊信息
-    primary_location = paper.get("primary_location", {}) or {}
-    source = primary_location.get("source", {}) or {}
+    # 位置信息
+    loc = w.get("primary_location", {}) or {}
+    src = loc.get("source", {}) or {}
     
-    # 提取主题信息
-    primary_topic = paper.get("primary_topic", {}) or {}
+    # 主题
+    topic = w.get("primary_topic", {}) or {}
     
-    # 提取关键词
-    keywords = [kw.get("display_name") for kw in paper.get("keywords", [])[:8]]
+    # 关键词
+    keywords = [{"keyword": k.get("display_name"), "score": round(k.get("score", 0), 3)} 
+                for k in w.get("keywords", [])[:15]]
     
-    return {
-        "id": paper.get("id", "").replace("https://openalex.org/", ""),
-        "doi": paper.get("doi"),
-        "title": paper.get("title"),
-        "publication_date": paper.get("publication_date"),
-        "publication_year": paper.get("publication_year"),
-        "language": paper.get("language"),
-        "type": paper.get("type"),
-        "cited_by_count": paper.get("cited_by_count"),
-        "fwci": paper.get("fwci"),
-        "is_top_1_percent": paper.get("citation_normalized_percentile", {}).get("is_in_top_1_percent"),
-        "journal": source.get("display_name"),
-        "publisher": source.get("host_organization_name"),
-        "volume": paper.get("biblio", {}).get("volume"),
-        "issue": paper.get("biblio", {}).get("issue"),
-        "pages": f"{paper.get('biblio', {}).get('first_page', '')}-{paper.get('biblio', {}).get('last_page', '')}".strip("-"),
-        "authors": authors,
-        "is_oa": paper.get("open_access", {}).get("is_oa"),
-        "oa_status": paper.get("open_access", {}).get("oa_status"),
-        "pdf_url": primary_location.get("pdf_url"),
-        "primary_topic": primary_topic.get("display_name"),
-        "field": primary_topic.get("field", {}).get("display_name"),
-        "domain": primary_topic.get("domain", {}).get("display_name"),
-        "keywords": keywords,
-        "referenced_works_count": paper.get("referenced_works_count"),
-        "abstract": _reconstruct_abstract(paper.get("abstract_inverted_index")),
-    }
-
-
-def _reconstruct_abstract(inverted_index: dict | None) -> str | None:
-    """从倒排索引重建摘要文本"""
-    if not inverted_index:
-        return None
+    # 资助/奖项 (新的 awards 字段)
+    awards = w.get("awards", [])
+    funders = [{
+        "id": _clean_id(f.get("id", "")),
+        "name": f.get("display_name"),
+        "country": f.get("country_code"),
+    } for f in w.get("funders", [])]
+    
+    # 可持续发展目标
+    sdgs = [{
+        "id": s.get("id"),
+        "name": s.get("display_name"),
+        "score": s.get("score"),
+    } for s in w.get("sustainable_development_goals", [])]
     
     # 重建摘要
-    words = []
-    for word, positions in inverted_index.items():
-        for pos in positions:
-            words.append((pos, word))
+    abstract = None
+    if w.get("abstract_inverted_index"):
+        words = []
+        for word, positions in w["abstract_inverted_index"].items():
+            for pos in positions:
+                words.append((pos, word))
+        words.sort()
+        abstract = " ".join(word for _, word in words)
     
-    words.sort(key=lambda x: x[0])
-    return " ".join(word for _, word in words)
+    return {
+        "id": _clean_id(w.get("id", "")),
+        "title": w.get("title"),
+        "doi": w.get("doi"),
+        "publication_date": w.get("publication_date"),
+        "publication_year": w.get("publication_year"),
+        "type": w.get("type"),
+        "language": w.get("language"),
+        "cited_by_count": w.get("cited_by_count"),
+        "fwci": w.get("fwci"),
+        "is_retracted": w.get("is_retracted"),
+        "is_oa": w.get("open_access", {}).get("is_oa"),
+        "oa_status": w.get("open_access", {}).get("oa_status"),
+        "pdf_url": loc.get("pdf_url"),
+        "journal": src.get("display_name"),
+        "publisher": src.get("host_organization_name"),
+        "volume": w.get("biblio", {}).get("volume"),
+        "issue": w.get("biblio", {}).get("issue"),
+        "pages": f"{w.get('biblio', {}).get('first_page', '')}-{w.get('biblio', {}).get('last_page', '')}".strip("-"),
+        "authors": authors,
+        "keywords": keywords,
+        "funders": funders,
+        "awards": awards,
+        "sustainable_development_goals": sdgs if sdgs else None,
+        "primary_topic": topic.get("display_name"),
+        "field": topic.get("field", {}).get("display_name") if topic.get("field") else None,
+        "domain": topic.get("domain", {}).get("display_name") if topic.get("domain") else None,
+        "referenced_works_count": w.get("referenced_works_count"),
+        "abstract": abstract,
+    }
 
 
-def _format_author(author: dict) -> dict:
+def _format_author(a: dict) -> dict:
     """格式化作者信息"""
     return {
-        "id": author.get("id", "").replace("https://openalex.org/", ""),
-        "name": author.get("display_name"),
-        "orcid": author.get("orcid"),
-        "works_count": author.get("works_count"),
-        "cited_by_count": author.get("cited_by_count"),
-        "h_index": author.get("summary_stats", {}).get("h_index"),
-        "affiliations": [
-            inst.get("display_name") 
-            for inst in author.get("affiliations", [])[:3]
-        ],
-        "topics": [
-            topic.get("display_name")
-            for topic in author.get("topics", [])[:5]
-        ],
+        "id": _clean_id(a.get("id", "")),
+        "name": a.get("display_name"),
+        "orcid": a.get("orcid"),
+        "works_count": a.get("works_count"),
+        "cited_by_count": a.get("cited_by_count"),
+        "h_index": a.get("summary_stats", {}).get("h_index"),
+        "affiliations": [i.get("display_name") for i in a.get("affiliations", [])[:5]],
+        "topics": [t.get("display_name") for t in a.get("topics", [])[:5]],
     }
 
 
-def _format_source(source: dict) -> dict:
+def _format_source(s: dict) -> dict:
     """格式化期刊/来源信息"""
     return {
-        "id": source.get("id", "").replace("https://openalex.org/", ""),
-        "name": source.get("display_name"),
-        "issn": source.get("issn_l"),
-        "publisher": source.get("host_organization_name"),
-        "type": source.get("type"),
-        "works_count": source.get("works_count"),
-        "cited_by_count": source.get("cited_by_count"),
-        "is_oa": source.get("is_oa"),
-        "homepage_url": source.get("homepage_url"),
+        "id": _clean_id(s.get("id", "")),
+        "name": s.get("display_name"),
+        "issn": s.get("issn_l"),
+        "type": s.get("type"),
+        "publisher": s.get("host_organization_name"),
+        "works_count": s.get("works_count"),
+        "cited_by_count": s.get("cited_by_count"),
+        "is_oa": s.get("is_oa"),
+        "homepage": s.get("homepage_url"),
     }
 
 
-def _format_institution(inst: dict) -> dict:
+def _format_institution(i: dict) -> dict:
     """格式化机构信息"""
     return {
-        "id": inst.get("id", "").replace("https://openalex.org/", ""),
-        "name": inst.get("display_name"),
-        "ror": inst.get("ror"),
-        "type": inst.get("type"),
-        "country": inst.get("country_code"),
-        "city": inst.get("geo", {}).get("city"),
-        "works_count": inst.get("works_count"),
-        "cited_by_count": inst.get("cited_by_count"),
-        "homepage_url": inst.get("homepage_url"),
-        "image_url": inst.get("image_url"),
+        "id": _clean_id(i.get("id", "")),
+        "name": i.get("display_name"),
+        "ror": i.get("ror"),
+        "type": i.get("type"),
+        "country": i.get("country_code"),
+        "city": i.get("geo", {}).get("city") if i.get("geo") else None,
+        "works_count": i.get("works_count"),
+        "cited_by_count": i.get("cited_by_count"),
+        "homepage": i.get("homepage_url"),
     }
 
 
-def _format_topic(topic: dict) -> dict:
+def _format_topic(t: dict) -> dict:
     """格式化主题信息"""
     return {
-        "id": topic.get("id", "").replace("https://openalex.org/", ""),
-        "name": topic.get("display_name"),
-        "description": topic.get("description"),
-        "works_count": topic.get("works_count"),
-        "cited_by_count": topic.get("cited_by_count"),
-        "subfield": topic.get("subfield", {}).get("display_name"),
-        "field": topic.get("field", {}).get("display_name"),
-        "domain": topic.get("domain", {}).get("display_name"),
-        "keywords": topic.get("keywords", [])[:10],
+        "id": _clean_id(t.get("id", "")),
+        "name": t.get("display_name"),
+        "description": t.get("description"),
+        "works_count": t.get("works_count"),
+        "subfield": t.get("subfield", {}).get("display_name") if t.get("subfield") else None,
+        "field": t.get("field", {}).get("display_name") if t.get("field") else None,
+        "domain": t.get("domain", {}).get("display_name") if t.get("domain") else None,
+        "keywords": t.get("keywords", [])[:10],
     }
 
 
-def _format_publisher(publisher: dict) -> dict:
-    """格式化出版商信息"""
-    return {
-        "id": publisher.get("id", "").replace("https://openalex.org/", ""),
-        "name": publisher.get("display_name"),
-        "alternate_titles": publisher.get("alternate_titles", []),
-        "country_codes": publisher.get("country_codes", []),
-        "works_count": publisher.get("works_count"),
-        "cited_by_count": publisher.get("cited_by_count"),
-        "sources_count": publisher.get("sources_api_url", "").split("per-page=")[0] if publisher.get("sources_api_url") else None,
-        "homepage_url": publisher.get("homepage_url"),
-    }
-
-
-def _format_funder(funder: dict) -> dict:
+def _format_funder(f: dict) -> dict:
     """格式化资助机构信息"""
     return {
-        "id": funder.get("id", "").replace("https://openalex.org/", ""),
-        "name": funder.get("display_name"),
-        "alternate_titles": funder.get("alternate_titles", []),
-        "country_code": funder.get("country_code"),
-        "description": funder.get("description"),
-        "works_count": funder.get("works_count"),
-        "cited_by_count": funder.get("cited_by_count"),
-        "grants_count": funder.get("grants_count"),
-        "homepage_url": funder.get("homepage_url"),
+        "id": _clean_id(f.get("id", "")),
+        "name": f.get("display_name"),
+        "country": f.get("country_code"),
+        "description": f.get("description"),
+        "works_count": f.get("works_count"),
+        "cited_by_count": f.get("cited_by_count"),
+        "grants_count": f.get("grants_count"),
+        "homepage": f.get("homepage_url"),
     }
 
 
-def _format_geo(geo: dict) -> dict:
-    """格式化地理位置信息"""
+def _format_keyword(k: dict) -> dict:
+    """格式化关键词信息"""
     return {
-        "id": geo.get("id", "").replace("https://openalex.org/", ""),
-        "name": geo.get("display_name"),
-        "code": geo.get("country_code") or geo.get("id", "").split("/")[-1],
-        "works_count": geo.get("works_count"),
-        "cited_by_count": geo.get("cited_by_count"),
+        "id": _clean_id(k.get("id", "")),
+        "keyword": k.get("display_name"),
+        "works_count": k.get("works_count"),
+        "cited_by_count": k.get("cited_by_count"),
     }
 
 
 def _format_entity_brief(entity: dict, entity_type: str) -> dict:
-    """根据实体类型格式化简要信息"""
+    """根据类型格式化实体简要信息"""
+    if entity_type == "works":
+        return _format_work_brief(entity)
+    
     base = {
-        "id": entity.get("id", "").replace("https://openalex.org/", ""),
+        "id": _clean_id(entity.get("id", "")),
         "name": entity.get("display_name"),
     }
     
-    if entity_type == "works":
-        return _format_paper_brief(entity)
-    elif entity_type == "authors":
-        base.update({
-            "works_count": entity.get("works_count"),
-            "cited_by_count": entity.get("cited_by_count"),
-        })
+    if entity_type == "authors":
+        base["works_count"] = entity.get("works_count")
+        base["cited_by_count"] = entity.get("cited_by_count")
     elif entity_type == "sources":
-        base.update({
-            "type": entity.get("type"),
-            "works_count": entity.get("works_count"),
-            "publisher": entity.get("host_organization_name"),
-        })
+        base["type"] = entity.get("type")
+        base["works_count"] = entity.get("works_count")
     elif entity_type == "institutions":
-        base.update({
-            "type": entity.get("type"),
-            "country": entity.get("country_code"),
-            "works_count": entity.get("works_count"),
-        })
+        base["type"] = entity.get("type")
+        base["country"] = entity.get("country_code")
+        base["works_count"] = entity.get("works_count")
     elif entity_type == "topics":
-        base.update({
-            "works_count": entity.get("works_count"),
-            "field": entity.get("field", {}).get("display_name") if entity.get("field") else None,
-        })
+        base["works_count"] = entity.get("works_count")
+        base["field"] = entity.get("field", {}).get("display_name") if entity.get("field") else None
     elif entity_type == "publishers":
-        base.update({
-            "works_count": entity.get("works_count"),
-            "country_codes": entity.get("country_codes", []),
-        })
+        base["works_count"] = entity.get("works_count")
     elif entity_type == "funders":
-        base.update({
-            "works_count": entity.get("works_count"),
-            "country_code": entity.get("country_code"),
-        })
+        base["country"] = entity.get("country_code")
+        base["works_count"] = entity.get("works_count")
+    elif entity_type == "keywords":
+        base["keyword"] = entity.get("display_name")
+        base["works_count"] = entity.get("works_count")
     elif entity_type in ("continents", "countries"):
-        base.update({
-            "code": entity.get("country_code") or entity.get("id", "").split("/")[-1],
-            "works_count": entity.get("works_count"),
-        })
+        base["code"] = entity.get("country_code") or _clean_id(entity.get("id", "")).split("/")[-1]
+        base["works_count"] = entity.get("works_count")
     
     return base
 
 
 def _format_entity_full(entity: dict, entity_type: str) -> dict:
-    """根据实体类型格式化完整信息"""
-    if entity_type == "works":
-        return _format_paper_full(entity)
-    elif entity_type == "authors":
-        return _format_author(entity)
-    elif entity_type == "sources":
-        return _format_source(entity)
-    elif entity_type == "institutions":
-        return _format_institution(entity)
-    elif entity_type == "topics":
-        return _format_topic(entity)
-    elif entity_type == "publishers":
-        return _format_publisher(entity)
-    elif entity_type == "funders":
-        return _format_funder(entity)
-    elif entity_type in ("continents", "countries"):
-        return _format_geo(entity)
-    else:
-        return entity
+    """根据类型格式化实体完整信息"""
+    formatters = {
+        "works": _format_work_full,
+        "authors": _format_author,
+        "sources": _format_source,
+        "institutions": _format_institution,
+        "topics": _format_topic,
+        "funders": _format_funder,
+        "keywords": _format_keyword,
+    }
+    formatter = formatters.get(entity_type)
+    if formatter:
+        return formatter(entity)
+    
+    # 默认格式
+    return {
+        "id": _clean_id(entity.get("id", "")),
+        "name": entity.get("display_name"),
+        "works_count": entity.get("works_count"),
+        "cited_by_count": entity.get("cited_by_count"),
+    }
 
 
-# 定义搜索实体类型
-SearchEntityType = Literal["works", "authors", "sources", "institutions", "topics", "publishers", "funders", "continents", "countries"]
-
-# 定义获取实体类型
-FetchEntityType = Literal["work", "author", "source", "institution", "topic", "publisher", "funder", "continent", "country"]
-
+# ============================================================================
+# MCP Tools
+# ============================================================================
 
 @mcp.tool(
     name="search_openalex",
-    description="搜索学术实体：论文、作者、期刊、机构、主题、出版商、资助机构等。返回匹配结果的 ID 列表和摘要信息。",
-    tags={"search", "openalex", "academic"}
+    description="简单搜索 OpenAlex 实体。适合基本查询，如按关键词搜索论文、作者或机构。",
+    tags={"search", "openalex"}
 )
 def search_openalex(
     query: str,
-    entity_type: SearchEntityType = "works",
+    entity_type: SEARCH_ENTITY_TYPES = "works",
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
     country: Optional[str] = None,
-    institution: Optional[str] = None,
-    open_access: Optional[bool] = None,
-    sort_by: Literal["cited_by_count", "publication_date", "relevance", "works_count"] = "cited_by_count",
-    limit: int = 10
+    is_oa: Optional[bool] = None,
+    sort: Literal["cited_by_count", "publication_date", "relevance", "works_count"] = "cited_by_count",
+    limit: int = 15
 ) -> dict:
     """
-    在 OpenAlex 中搜索学术实体。
+    简单搜索 OpenAlex 实体。
     
     Args:
-        query: 搜索关键词，例如 "machine learning" 或 "Harvard University"
-        entity_type: 实体类型，可选值:
-            - "works": 论文、书籍、数据集（默认）
-            - "authors": 作者
-            - "sources": 期刊、会议、预印本服务器
-            - "institutions": 大学、研究机构
-            - "topics": 主题分类
-            - "publishers": 出版商
-            - "funders": 资助机构
-            - "continents": 大洲
-            - "countries": 国家
-        year_from: 起始年份过滤（对 works 有效），例如 2020
-        year_to: 结束年份过滤（对 works 有效），例如 2025
-        country: 国家代码过滤（对 works/authors/institutions 有效），例如 "CN", "US"
-        institution: 机构名称或ID过滤（对 works/authors 有效）
-        open_access: 是否开放获取（仅对 works 有效）
-        sort_by: 排序方式:
-            - "cited_by_count": 按引用数排序（默认）
-            - "publication_date": 按发表日期排序（仅 works）
-            - "relevance": 按相关度排序
-            - "works_count": 按论文数排序（适用于 authors/institutions/topics 等）
-        limit: 返回结果数量，默认10，最大50
+        query: 搜索关键词，支持 Boolean 语法如 "AI AND ML"、"deep learning" NOT NLP
+        entity_type: 实体类型 (works/authors/sources/institutions/topics/publishers/funders/keywords)
+        year_from: 起始年份 (仅 works 有效)
+        year_to: 结束年份 (仅 works 有效)
+        country: 国家代码如 CN, US, DE (对 works/authors/institutions 有效)
+        is_oa: 是否开放获取 (仅 works 有效)
+        sort: 排序方式
+        limit: 返回数量 (默认15, 最大50)
     
     Returns:
-        包含搜索结果的字典:
-        - total_count: 总匹配数
-        - results: 结果列表，每项包含 id 和基本信息
-        
-    使用示例:
-        搜索论文: search_openalex("deep learning", entity_type="works", year_from=2024)
-        搜索作者: search_openalex("Yann LeCun", entity_type="authors")
-        搜索机构: search_openalex("MIT", entity_type="institutions")
-        搜索期刊: search_openalex("Nature", entity_type="sources")
-        搜索主题: search_openalex("artificial intelligence", entity_type="topics")
-        搜索出版商: search_openalex("Elsevier", entity_type="publishers")
-        搜索资助机构: search_openalex("NSF", entity_type="funders")
-        搜索国家: search_openalex("China", entity_type="countries")
+        搜索结果列表
+    
+    示例:
+        搜索 2024 年 AI 论文: search_openalex("artificial intelligence", year_from=2024)
+        搜索中国机构: search_openalex("university", entity_type="institutions", country="CN")
+        搜索 LLM 关键词: search_openalex("large language model", entity_type="keywords")
     """
-    # 验证实体类型
-    if entity_type not in ENTITY_TYPES:
-        return {"error": f"不支持的实体类型: {entity_type}。支持的类型: {list(ENTITY_TYPES.keys())}"}
+    endpoint = ENTITY_ENDPOINTS.get(entity_type, "works")
     
-    endpoint = ENTITY_TYPES[entity_type]
+    params = {"search": query, "per-page": min(limit, 50)}
     
-    params = {
-        "search": query,
-        "per-page": min(limit, 50),
-    }
-    
-    # 构建过滤条件
+    # 构建过滤器
     filters = []
-    current_year = datetime.datetime.now().year
-    
-    # 年份过滤（仅对 works 有效）
     if entity_type == "works":
+        current_year = datetime.datetime.now().year
         if year_from and year_to:
             filters.append(f"publication_year:{year_from}-{year_to}")
         elif year_from:
@@ -461,50 +384,36 @@ def search_openalex(
         elif year_to:
             filters.append(f"publication_year:1900-{year_to}")
         
-        # 开放获取过滤
-        if open_access is not None:
-            filters.append(f"is_oa:{str(open_access).lower()}")
+        if is_oa is not None:
+            filters.append(f"is_oa:{str(is_oa).lower()}")
         
-        # 国家过滤
         if country:
             filters.append(f"authorships.countries:{country.upper()}")
-        
-        # 机构过滤
-        if institution:
-            filters.append(f"authorships.institutions.display_name.search:{institution}")
     
-    # 作者的国家/机构过滤
-    elif entity_type == "authors":
-        if country:
-            filters.append(f"affiliations.institution.country_code:{country.upper()}")
-        if institution:
-            filters.append(f"affiliations.institution.display_name.search:{institution}")
+    elif entity_type == "authors" and country:
+        filters.append(f"affiliations.institution.country_code:{country.upper()}")
     
-    # 机构的国家过滤
-    elif entity_type == "institutions":
-        if country:
-            filters.append(f"country_code:{country.upper()}")
+    elif entity_type == "institutions" and country:
+        filters.append(f"country_code:{country.upper()}")
     
     if filters:
         params["filter"] = ",".join(filters)
     
     # 排序
-    if sort_by == "cited_by_count":
-        params["sort"] = "cited_by_count:desc"
-    elif sort_by == "publication_date" and entity_type == "works":
-        params["sort"] = "publication_date:desc"
-    elif sort_by == "works_count" and entity_type != "works":
-        params["sort"] = "works_count:desc"
-    # relevance 是默认排序
+    sort_map = {
+        "cited_by_count": "cited_by_count:desc",
+        "publication_date": "publication_date:desc",
+        "works_count": "works_count:desc",
+    }
+    if sort in sort_map:
+        params["sort"] = sort_map[sort]
     
     try:
-        data = _make_request(endpoint, params)
-        
-        results = [_format_entity_brief(item, entity_type) for item in data.get("results", [])]
-        
+        data = _request(endpoint, params)
+        results = [_format_entity_brief(e, endpoint) for e in data.get("results", [])]
         return {
             "total_count": data.get("meta", {}).get("count"),
-            "entity_type": entity_type,
+            "entity_type": endpoint,
             "results": results
         }
     except requests.exceptions.HTTPError as e:
@@ -512,145 +421,176 @@ def search_openalex(
 
 
 @mcp.tool(
+    name="query_openalex",
+    description="高级查询 OpenAlex，支持原生 filter 语法和复杂过滤器组合。适合复杂的组合查询。",
+    tags={"query", "openalex", "advanced"}
+)
+def query_openalex(
+    entity_type: SEARCH_ENTITY_TYPES = "works",
+    filter: Optional[str] = None,
+    search: Optional[str] = None,
+    sort: str = "cited_by_count:desc",
+    group_by: Optional[str] = None,
+    limit: int = 25
+) -> dict:
+    """
+    高级查询 OpenAlex - 支持原生 filter 语法。
+    
+    Args:
+        entity_type: 实体类型
+        filter: OpenAlex 原生 filter 语法，支持:
+            - 单个过滤: publication_year:2024
+            - 范围: cited_by_count:>100 或 publication_year:2020-2024
+            - AND (逗号): publication_year:2024,is_oa:true
+            - OR (管道): publication_year:2023|2024
+            - NOT (感叹号): publication_year:!2024
+            - 嵌套: authorships.institutions.country_code:CN
+        search: 搜索关键词，支持 Boolean: (AI AND ML) NOT NLP, "exact phrase"
+        sort: 排序 (如 cited_by_count:desc, publication_date:desc, relevance_score:desc)
+        group_by: 分组聚合字段 (如 publication_year, authorships.countries)
+        limit: 返回数量 (默认25, 最大200)
+    
+    Returns:
+        查询结果或分组统计
+    
+    常用 filter 示例:
+        - 年份: publication_year:2024
+        - 引用数: cited_by_count:>100
+        - 开放获取: is_oa:true
+        - 国家: authorships.countries:CN
+        - 机构: authorships.institutions.id:I27837315
+        - 期刊: primary_location.source.id:S23254222
+        - 关键词: keywords.keyword:machine learning
+        - 主题: primary_topic.field.id:F123
+        - 语言: language:en
+        - 类型: type:article
+        - 资助机构: funders.id:F123456
+        - 大洲: authorships.institutions.continent:asia
+        
+    复杂查询示例:
+        - 2024年中国AI论文: filter="publication_year:2024,authorships.countries:CN", search="artificial intelligence"
+        - MIT高引论文: filter="authorships.institutions.id:I63966007,cited_by_count:>100"
+        - Nature期刊开放获取: filter="primary_location.source.id:S137773608,is_oa:true"
+    """
+    endpoint = ENTITY_ENDPOINTS.get(entity_type, "works")
+    
+    params = {"per-page": min(limit, 200)}
+    
+    if filter:
+        params["filter"] = filter
+    
+    if search:
+        params["search"] = search
+    
+    if sort:
+        params["sort"] = sort
+    
+    if group_by:
+        params["group_by"] = group_by
+    
+    try:
+        data = _request(endpoint, params)
+        
+        # 如果是分组查询
+        if group_by and data.get("group_by"):
+            return {
+                "total_count": data.get("meta", {}).get("count"),
+                "entity_type": endpoint,
+                "group_by": group_by,
+                "groups": data.get("group_by", [])
+            }
+        
+        results = [_format_entity_brief(e, endpoint) for e in data.get("results", [])]
+        return {
+            "total_count": data.get("meta", {}).get("count"),
+            "entity_type": endpoint,
+            "results": results
+        }
+    except requests.exceptions.HTTPError as e:
+        return {"error": f"查询失败: {str(e)}"}
+
+
+@mcp.tool(
     name="fetch_openalex",
-    description="获取论文、作者、期刊、机构等实体的详细信息。支持通过 OpenAlex ID 或 DOI 查询。",
-    tags={"fetch", "openalex", "academic"}
+    description="获取 OpenAlex 实体的详细信息。支持 ID、DOI、ORCID 等标识符。",
+    tags={"fetch", "openalex"}
 )
 def fetch_openalex(
     identifier: str,
-    entity_type: FetchEntityType = "work",
+    entity_type: FETCH_ENTITY_TYPES = "work",
     include_related: bool = False
 ) -> dict:
     """
-    获取 OpenAlex 实体的详细信息。
+    获取 OpenAlex 实体详情。
     
     Args:
-        identifier: 实体标识符，可以是:
-            - OpenAlex ID: 如 "W4391403992", "A5012301204", "S23254222", "I27837315"
-            - DOI: 如 "10.1080/00207543.2024.2309309" (仅对论文有效)
-            - ORCID: 如 "0000-0001-6187-6610" (仅对作者有效)
-            - ROR: 如 "https://ror.org/042nb2s44" (仅对机构有效)
-            - 完整 URL: 如 "https://openalex.org/W4391403992"
-        entity_type: 实体类型，可选值:
-            - "work": 论文（默认）
-            - "author": 作者
-            - "source": 期刊
-            - "institution": 机构
-            - "topic": 主题
-            - "publisher": 出版商
-            - "funder": 资助机构
-            - "continent": 大洲
-            - "country": 国家
-        include_related: 是否包含相关信息（如作者的代表作，机构的知名作者等），默认 False
+        identifier: 实体标识符:
+            - OpenAlex ID: W4391403992, A5012301204, I27837315
+            - DOI: 10.1038/s41586-021-03819-2 (仅 work)
+            - ORCID: 0000-0001-6187-6610 (仅 author)
+            - ROR: https://ror.org/042nb2s44 (仅 institution)
+        entity_type: 实体类型 (work/author/source/institution/topic/publisher/funder/keyword)
+        include_related: 是否包含相关实体 (如作者的代表作、机构的知名作者)
     
     Returns:
-        实体的详细信息
-        
-    使用示例:
+        实体详细信息，包含 keywords、funders、awards、SDGs 等
+    
+    示例:
         获取论文: fetch_openalex("10.1038/s41586-021-03819-2")
         获取作者: fetch_openalex("A5012301204", entity_type="author", include_related=True)
-        获取期刊: fetch_openalex("S23254222", entity_type="source")
-        获取机构: fetch_openalex("I27837315", entity_type="institution")
-        获取主题: fetch_openalex("T10000", entity_type="topic")
+        获取机构: fetch_openalex("I63966007", entity_type="institution")
     """
-    # 验证实体类型
-    if entity_type not in ENTITY_TYPE_SINGULAR:
-        return {"error": f"不支持的实体类型: {entity_type}。支持的类型: {list(ENTITY_TYPE_SINGULAR.keys())}"}
-    
-    endpoint_type = ENTITY_TYPE_SINGULAR[entity_type]
+    endpoint = ENTITY_ENDPOINTS.get(entity_type, "works")
     
     # 规范化标识符
-    id_clean = identifier.strip()
+    id_clean = identifier.strip().replace("https://openalex.org/", "")
     
-    # 移除 URL 前缀
-    if id_clean.startswith("https://openalex.org/"):
-        id_clean = id_clean.replace("https://openalex.org/", "")
-    
-    # 对于 DOI，添加前缀
+    # DOI 格式化
     if entity_type == "work" and (id_clean.startswith("10.") or "doi.org" in id_clean):
         if not id_clean.startswith("https://doi.org/"):
-            if id_clean.startswith("doi.org/"):
-                id_clean = f"https://{id_clean}"
-            else:
-                id_clean = f"https://doi.org/{id_clean}"
+            id_clean = f"https://doi.org/{id_clean.replace('doi.org/', '')}"
     
-    # 对于 ORCID
+    # ORCID 格式化
     if entity_type == "author" and id_clean.startswith("0000-"):
         id_clean = f"https://orcid.org/{id_clean}"
     
     try:
-        data = _make_request(f"{endpoint_type}/{id_clean}")
-        result = _format_entity_full(data, endpoint_type)
+        data = _request(f"{endpoint}/{id_clean}")
+        result = _format_entity_full(data, endpoint)
         
-        # 获取相关信息
+        # 获取相关实体
         if include_related:
             if entity_type == "author":
-                # 获取作者的代表作
-                works_data = _make_request("works", {
+                works = _request("works", {
                     "filter": f"author.id:{data['id']}",
                     "sort": "cited_by_count:desc",
                     "per-page": 5,
-                    "select": "id,title,doi,publication_date,cited_by_count,primary_location"
                 })
-                result["top_works"] = [
-                    {
-                        "id": p.get("id", "").replace("https://openalex.org/", ""),
-                        "title": p.get("title"),
-                        "doi": p.get("doi"),
-                        "cited_by_count": p.get("cited_by_count"),
-                        "journal": (p.get("primary_location", {}) or {}).get("source", {}).get("display_name") if p.get("primary_location") else None,
-                    }
-                    for p in works_data.get("results", [])
-                ]
+                result["top_works"] = [_format_work_brief(w) for w in works.get("results", [])]
+            
             elif entity_type == "source":
-                # 获取期刊的高引论文
-                works_data = _make_request("works", {
+                works = _request("works", {
                     "filter": f"primary_location.source.id:{data['id']}",
                     "sort": "cited_by_count:desc",
                     "per-page": 5,
-                    "select": "id,title,doi,publication_date,cited_by_count,authorships"
                 })
-                result["top_works"] = [
-                    {
-                        "id": p.get("id", "").replace("https://openalex.org/", ""),
-                        "title": p.get("title"),
-                        "cited_by_count": p.get("cited_by_count"),
-                        "first_author": p.get("authorships", [{}])[0].get("author", {}).get("display_name") if p.get("authorships") else None,
-                    }
-                    for p in works_data.get("results", [])
-                ]
+                result["top_works"] = [_format_work_brief(w) for w in works.get("results", [])]
+            
             elif entity_type == "institution":
-                # 获取机构的知名作者
-                authors_data = _make_request("authors", {
+                authors = _request("authors", {
                     "filter": f"affiliations.institution.id:{data['id']}",
                     "sort": "cited_by_count:desc",
                     "per-page": 5,
                 })
-                result["top_authors"] = [
-                    {
-                        "id": a.get("id", "").replace("https://openalex.org/", ""),
-                        "name": a.get("display_name"),
-                        "works_count": a.get("works_count"),
-                        "cited_by_count": a.get("cited_by_count"),
-                    }
-                    for a in authors_data.get("results", [])
-                ]
-            elif entity_type == "topic":
-                # 获取主题下的高引论文
-                works_data = _make_request("works", {
-                    "filter": f"primary_topic.id:{data['id']}",
+                result["top_authors"] = [_format_author(a) for a in authors.get("results", [])]
+            
+            elif entity_type == "funder":
+                works = _request("works", {
+                    "filter": f"funders.id:{data['id']}",
                     "sort": "cited_by_count:desc",
                     "per-page": 5,
-                    "select": "id,title,doi,cited_by_count"
                 })
-                result["top_works"] = [
-                    {
-                        "id": p.get("id", "").replace("https://openalex.org/", ""),
-                        "title": p.get("title"),
-                        "cited_by_count": p.get("cited_by_count"),
-                    }
-                    for p in works_data.get("results", [])
-                ]
+                result["top_works"] = [_format_work_brief(w) for w in works.get("results", [])]
         
         return result
         
@@ -658,16 +598,68 @@ def fetch_openalex(
         return {"error": f"获取失败: {str(e)}"}
 
 
+# ============================================================================
+# MCP Resource: Filter 参考手册
+# ============================================================================
+
+@mcp.resource("resource://openalex-filters")
+def get_filter_reference() -> str:
+    """OpenAlex Filter 语法快速参考"""
+    return """
+# OpenAlex Filter 语法参考
+
+## 逻辑运算
+- AND (逗号): filter=A,B  →  A 且 B
+- OR (管道):  filter=A|B  →  A 或 B
+- NOT (感叹号): filter=!A  →  非 A
+- 范围: filter=field:min-max 或 filter=field:>100
+
+## Works 常用过滤器
+| 过滤器 | 示例 | 说明 |
+|--------|------|------|
+| publication_year | publication_year:2024 | 发表年份 |
+| cited_by_count | cited_by_count:>100 | 引用数 |
+| is_oa | is_oa:true | 开放获取 |
+| language | language:en | 语言 |
+| type | type:article | 类型(article/book/dataset) |
+| is_retracted | is_retracted:false | 是否撤稿 |
+| authorships.countries | authorships.countries:CN | 作者国家 |
+| authorships.institutions.id | authorships.institutions.id:I27837315 | 作者机构 |
+| authorships.institutions.continent | authorships.institutions.continent:asia | 大洲 |
+| primary_location.source.id | primary_location.source.id:S23254222 | 期刊 |
+| primary_topic.field.id | primary_topic.field.id:F123 | 领域 |
+| keywords.keyword | keywords.keyword:machine learning | 关键词 |
+| funders.id | funders.id:F1234567 | 资助机构 |
+
+## 搜索语法 (search 参数)
+- AND: machine AND learning
+- OR: AI OR ML
+- NOT: deep learning NOT NLP
+- 精确短语: "large language model"
+- 组合: (AI AND ML) NOT (NLP OR sentiment)
+
+## 常见 ID 前缀
+- W: Works (论文)
+- A: Authors (作者)
+- S: Sources (期刊)
+- I: Institutions (机构)
+- T: Topics (主题)
+- P: Publishers (出版商)
+- F: Funders (资助机构)
+"""
+
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+
 def main():
-    """入口点函数，用于 uvx 和 pip install 后直接运行"""
+    """入口点函数"""
     import sys
-    
-    # 检查是否使用 HTTP 模式
     if "--http" in sys.argv:
         print("Starting OpenAlex MCP Server in HTTP mode on port 8000...")
         mcp.run(transport="http", port=8000)
     else:
-        # 默认使用 stdio 模式（用于 Cursor/Claude Desktop）
         mcp.run()
 
 
